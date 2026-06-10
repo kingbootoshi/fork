@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# fork - instant copy-on-write repo forks with forked agent chats.
+#
+# Run from inside Claude Code or Codex shell mode (!) to fork BOTH the repo
+# and the current chat into a new tmux window, sitting in the clone.
+#
+#   fork <name>            clone repo + branch + fork current agent chat into tmux
+#   fork <name> --no-agent clone repo + branch + plain shell in tmux
+#   fork <name> --bg       create the tmux window without switching focus to it
+#   fork ls                list forks of the current repo
+#   fork path <name>       print a fork's path
+#   fork merge <name>      fetch fork/<name> branch back into the source repo
+#   fork rm <name>         trash a fork (and kill its tmux window/session)
+#
+# Mechanism: APFS clonefile(2) snapshots the whole repo (git state, .env,
+# node_modules, everything) in ~1s with zero disk cost. Claude chats fork via
+# `claude --resume <id> --fork-session` (session file copied to the clone's
+# project dir). Codex chats fork via native `codex fork <id>`.
+
+set -euo pipefail
+
+CLONEDIR="${FORK_CLONEDIR:-$HOME/.local/bin/clonedir}"
+FORKS_BASENAME=".forks"
+
+die() { printf 'fork: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*" >&2; }
+
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+
+repo_root() {
+    git rev-parse --show-toplevel 2>/dev/null || die "not inside a git repo"
+}
+
+# Claude Code encodes project paths by replacing every non-alphanumeric char with '-'
+encode_path() {
+    local p="$1"
+    printf '%s' "${p//[^A-Za-z0-9]/-}"
+}
+
+forks_dir_for() { # <root>
+    local root="$1"
+    printf '%s/%s/%s' "$(dirname "$root")" "$FORKS_BASENAME" "$(basename "$root")"
+}
+
+# ---------------------------------------------------------------------------
+# agent detection: which chat are we forking?
+# ---------------------------------------------------------------------------
+
+# Find the live codex session for this repo: CODEX_THREAD_ID if exported,
+# otherwise the newest rollout file (touched in the last 30 min) whose
+# recorded cwd is inside the repo.
+codex_session_id() { # <root>
+    local root="$1"
+    if [ -n "${CODEX_THREAD_ID:-}" ]; then
+        printf '%s' "$CODEX_THREAD_ID"
+        return 0
+    fi
+    local f cwd
+    while IFS= read -r f; do
+        cwd=$(head -c 2000 "$f" | sed -n 's/.*"cwd":"\([^"]*\)".*/\1/p')
+        case "$cwd" in
+            "$root"|"$root"/*)
+                basename "$f" .jsonl | sed 's/^rollout-[0-9T-]*-//'
+                return 0 ;;
+        esac
+    done < <(find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' -mmin -30 2>/dev/null \
+             | xargs -I{} stat -f '%m {}' {} 2>/dev/null | sort -rn | cut -d' ' -f2-)
+    return 1
+}
+
+# Build the command that opens the forked chat inside the clone.
+# Prints the command; prints nothing when no agent context is found.
+agent_command() { # <root> <dst> <mode: auto|claude|codex|none>
+    local root="$1" dst="$2" mode="$3" sid src_file dst_enc
+
+    [ "$mode" = "none" ] && return 0
+
+    if [ "$mode" = "claude" ] || { [ "$mode" = "auto" ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; }; then
+        sid="${CLAUDE_CODE_SESSION_ID:-}"
+        [ -n "$sid" ] || die "no CLAUDE_CODE_SESSION_ID in env - run fork from inside Claude Code shell mode"
+        src_file=$(ls "$HOME/.claude/projects/"*/"$sid.jsonl" 2>/dev/null | head -1) \
+            || die "session file for $sid not found under ~/.claude/projects"
+        dst_enc=$(encode_path "$(cd "$dst" && pwd -P)")
+        mkdir -p "$HOME/.claude/projects/$dst_enc"
+        cp "$src_file" "$HOME/.claude/projects/$dst_enc/"
+        printf 'claude --resume %s --fork-session' "$sid"
+        return 0
+    fi
+
+    if [ "$mode" = "codex" ] || [ "$mode" = "auto" ]; then
+        if sid=$(codex_session_id "$root") && [ -n "$sid" ]; then
+            printf 'codex fork %s' "$sid"
+            return 0
+        fi
+        [ "$mode" = "codex" ] && die "no codex session found for this repo (last 30 min)"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# tmux plumbing
+# ---------------------------------------------------------------------------
+
+open_in_tmux() { # <name> <repo> <dst> <cmd> <bg>
+    local name="$1" repo="$2" dst="$3" cmd="$4" bg="$5"
+    local setup="export COMPOSE_PROJECT_NAME=${repo}-${name}"
+    local line="$setup"
+    [ -n "$cmd" ] && line="$setup; $cmd"
+
+    if [ -n "${TMUX:-}" ]; then
+        local flags=(-P -F '#{window_id}' -n "$name" -c "$dst")
+        [ "$bg" = "1" ] && flags=(-d "${flags[@]}")
+        local wid
+        wid=$(tmux new-window "${flags[@]}")
+        tmux send-keys -t "$wid" "$line" Enter
+        note "forked into tmux window '$name'"
+    else
+        local sess="fork-${repo}-${name}"
+        sess="${sess//[.:]/-}"
+        tmux new-session -d -s "$sess" -c "$dst" 2>/dev/null \
+            || die "tmux session '$sess' already exists"
+        tmux send-keys -t "$sess" "$line" Enter
+        if [ "${TERM_PROGRAM:-}" = "Apple_Terminal" ] && [ -z "${SSH_TTY:-}" ] && [ "$bg" != "1" ]; then
+            osascript -e "tell application \"Terminal\" to do script \"tmux attach -t $sess\"" >/dev/null 2>&1 \
+                && note "forked into new Terminal window (tmux session '$sess')" \
+                || note "attach with: tmux attach -t $sess"
+        else
+            note "attach with: tmux attach -t $sess"
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+cmd_create() {
+    local name="" mode="auto" bg="0"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --claude) mode="claude" ;;
+            --codex)  mode="codex" ;;
+            --no-agent) mode="none" ;;
+            --bg)     bg="1" ;;
+            -*)       die "unknown flag: $1" ;;
+            *)        [ -n "$name" ] && die "one fork name only"; name="$1" ;;
+        esac
+        shift
+    done
+    [ -n "$name" ] || { usage; exit 2; }
+    case "$name" in
+        */*|.*) die "fork name must be a simple name (no slashes, no leading dot)" ;;
+    esac
+
+    command -v tmux >/dev/null || die "tmux not installed"
+    [ -x "$CLONEDIR" ] || die "clonedir helper missing - run install.sh"
+
+    local root repo fdir dst
+    root=$(repo_root)
+    repo=$(basename "$root")
+    fdir=$(forks_dir_for "$root")
+    dst="$fdir/$name"
+    [ -e "$dst" ] && die "fork '$name' already exists: $dst"
+    mkdir -p "$fdir"
+
+    local t0 t1
+    t0=$(date +%s)
+    "$CLONEDIR" "$root" "$dst"
+    t1=$(date +%s)
+
+    git -C "$dst" switch -c "fork/$name" >/dev/null 2>&1 \
+        || note "warning: branch fork/$name already exists, staying on current branch"
+
+    local cmd
+    cmd=$(agent_command "$root" "$dst" "$mode")
+    [ -n "$cmd" ] && [ "$mode" != "none" ] && [[ "$cmd" == codex* ]] && cmd="$cmd --cd $dst"
+
+    open_in_tmux "$name" "$repo" "$dst" "$cmd" "$bg"
+
+    note "cloned in $((t1 - t0))s -> branch fork/$name"
+    [ -z "$cmd" ] && note "no agent chat detected - opened a plain shell"
+    printf '%s\n' "$dst"
+}
+
+cmd_ls() {
+    local root fdir d branch
+    root=$(repo_root)
+    fdir=$(forks_dir_for "$root")
+    [ -d "$fdir" ] || { note "no forks for $(basename "$root")"; return 0; }
+    for d in "$fdir"/*/; do
+        [ -d "$d" ] || continue
+        branch=$(git -C "$d" branch --show-current 2>/dev/null || echo "?")
+        printf '%-24s %-28s %s\n' "$(basename "$d")" "$branch" "${d%/}"
+    done
+}
+
+cmd_path() {
+    local root dst
+    root=$(repo_root)
+    dst="$(forks_dir_for "$root")/$1"
+    [ -d "$dst" ] || die "no fork named '$1'"
+    printf '%s\n' "$dst"
+}
+
+cmd_merge() {
+    local root dst branch
+    root=$(repo_root)
+    dst="$(forks_dir_for "$root")/$1"
+    [ -d "$dst" ] || die "no fork named '$1'"
+    branch=$(git -C "$dst" branch --show-current)
+    [ -n "$branch" ] || die "fork '$1' is on detached HEAD"
+    git -C "$root" fetch "$dst" "$branch:$branch"
+    note "fetched '$branch' into $(basename "$root")"
+    note "next: git merge $branch   (or open a PR from it)"
+}
+
+cmd_rm() {
+    local root repo dst sess
+    root=$(repo_root)
+    repo=$(basename "$root")
+    dst="$(forks_dir_for "$root")/$1"
+    [ -d "$dst" ] || die "no fork named '$1'"
+    sess="fork-${repo}-$1"; sess="${sess//[.:]/-}"
+    tmux kill-session -t "$sess" 2>/dev/null || true
+    if [ -n "${TMUX:-}" ]; then tmux kill-window -t "$1" 2>/dev/null || true; fi
+    if command -v trash >/dev/null; then trash "$dst"; else rm -rf "$dst"; fi
+    note "removed fork '$1'"
+}
+
+case "${1:-}" in
+    ""|-h|--help|help) usage ;;
+    ls|list)           cmd_ls ;;
+    path|cd)           shift; [ $# -ge 1 ] || die "usage: fork path <name>"; cmd_path "$1" ;;
+    merge)             shift; [ $# -ge 1 ] || die "usage: fork merge <name>"; cmd_merge "$1" ;;
+    rm|remove|trash)   shift; [ $# -ge 1 ] || die "usage: fork rm <name>"; cmd_rm "$1" ;;
+    *)                 cmd_create "$@" ;;
+esac
