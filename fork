@@ -3,14 +3,19 @@
 #
 # Run from inside Claude Code or Codex shell mode (!) to fork BOTH the repo
 # and the current chat into a new tmux window, sitting in the clone.
+# Run from a raw repo root to clone + branch + open a FRESH chat there.
 #
-#   fork <name>            clone repo + branch + fork current agent chat into tmux
+#   fork <name>            clone + branch + chat in tmux:
+#                            inside an agent -> forks the current chat
+#                            raw terminal    -> fresh claude (FORK_AGENT=codex flips)
+#   fork <name> --claude   claude in the fork (forks current claude chat, else fresh)
+#   fork <name> --codex    codex in the fork (forks current codex chat, else fresh)
 #   fork <name> --no-agent clone repo + branch + plain shell in tmux
 #   fork <name> --bg       create the tmux window without switching focus to it
 #   fork ls                list forks of the current repo
 #   fork path <name>       print a fork's path
 #   fork merge <name>      fetch fork/<name> branch back into the source repo
-#   fork rm <name>         trash a fork (and kill its tmux window/session)
+#   fork trash <name>      trash a fork (and kill its tmux window/session)
 #
 # Mechanism: APFS clonefile(2) snapshots the whole repo (git state, .env,
 # node_modules, everything) in ~1s with zero disk cost. Claude chats fork via
@@ -43,58 +48,51 @@ forks_dir_for() { # <root>
 }
 
 # ---------------------------------------------------------------------------
-# agent detection: which chat are we forking?
+# agent selection: fork the current chat when inside one, start fresh otherwise
 # ---------------------------------------------------------------------------
 
-# Find the live codex session for this repo: CODEX_THREAD_ID if exported,
-# otherwise the newest rollout file (touched in the last 30 min) whose
-# recorded cwd is inside the repo.
-codex_session_id() { # <root>
-    local root="$1"
-    if [ -n "${CODEX_THREAD_ID:-}" ]; then
-        printf '%s' "$CODEX_THREAD_ID"
-        return 0
-    fi
-    local f cwd
-    while IFS= read -r f; do
-        cwd=$(head -c 2000 "$f" | sed -n 's/.*"cwd":"\([^"]*\)".*/\1/p')
-        case "$cwd" in
-            "$root"|"$root"/*)
-                basename "$f" .jsonl | sed 's/^rollout-[0-9T-]*-//'
-                return 0 ;;
-        esac
-    done < <(find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' -mmin -30 2>/dev/null \
-             | xargs -I{} stat -f '%m {}' {} 2>/dev/null | sort -rn | cut -d' ' -f2-)
-    return 1
-}
+# Build the command that opens the chat inside the clone.
+#   inside claude code (CLAUDE_CODE_SESSION_ID set) -> fork the current chat
+#   inside codex (CODEX_THREAD_ID set)              -> fork the current chat
+#   raw terminal                                    -> FRESH chat
+# Default fresh agent is claude; set FORK_AGENT=codex to flip, or force with
+# --claude / --codex. --no-agent opens a plain shell.
+agent_command() { # <dst> <mode: auto|claude|codex|none>
+    local dst="$1" mode="$2" sid src_file dst_enc
 
-# Build the command that opens the forked chat inside the clone.
-# Prints the command; prints nothing when no agent context is found.
-agent_command() { # <root> <dst> <mode: auto|claude|codex|none>
-    local root="$1" dst="$2" mode="$3" sid src_file dst_enc
+    case "$mode" in
+        none) return 0 ;;
+        auto)
+            if   [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then mode="claude"
+            elif [ -n "${CODEX_THREAD_ID:-}" ];        then mode="codex"
+            else mode="${FORK_AGENT:-claude}"
+            fi ;;
+    esac
 
-    [ "$mode" = "none" ] && return 0
-
-    if [ "$mode" = "claude" ] || { [ "$mode" = "auto" ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; }; then
+    if [ "$mode" = "claude" ]; then
         sid="${CLAUDE_CODE_SESSION_ID:-}"
-        [ -n "$sid" ] || die "no CLAUDE_CODE_SESSION_ID in env - run fork from inside Claude Code shell mode"
-        src_file=$(ls "$HOME/.claude/projects/"*/"$sid.jsonl" 2>/dev/null | head -1) \
-            || die "session file for $sid not found under ~/.claude/projects"
-        dst_enc=$(encode_path "$(cd "$dst" && pwd -P)")
-        mkdir -p "$HOME/.claude/projects/$dst_enc"
-        cp "$src_file" "$HOME/.claude/projects/$dst_enc/"
-        printf 'claude --resume %s --fork-session' "$sid"
+        src_file=""
+        [ -n "$sid" ] && src_file=$(ls "$HOME/.claude/projects/"*/"$sid.jsonl" 2>/dev/null | head -1)
+        if [ -n "$src_file" ]; then
+            dst_enc=$(encode_path "$(cd "$dst" && pwd -P)")
+            mkdir -p "$HOME/.claude/projects/$dst_enc"
+            cp "$src_file" "$HOME/.claude/projects/$dst_enc/"
+            printf 'claude --resume %s --fork-session' "$sid"
+        else
+            printf 'claude'
+        fi
         return 0
     fi
 
-    if [ "$mode" = "codex" ] || [ "$mode" = "auto" ]; then
-        if sid=$(codex_session_id "$root") && [ -n "$sid" ]; then
-            printf 'codex fork %s' "$sid"
-            return 0
+    if [ "$mode" = "codex" ]; then
+        if [ -n "${CODEX_THREAD_ID:-}" ]; then
+            printf 'codex fork %s' "$CODEX_THREAD_ID"
+        else
+            printf 'codex'
         fi
-        [ "$mode" = "codex" ] && die "no codex session found for this repo (last 30 min)"
+        return 0
     fi
-    return 0
+    die "unknown agent mode: $mode"
 }
 
 # ---------------------------------------------------------------------------
@@ -172,13 +170,17 @@ cmd_create() {
         || note "warning: branch fork/$name already exists, staying on current branch"
 
     local cmd
-    cmd=$(agent_command "$root" "$dst" "$mode")
-    [ -n "$cmd" ] && [ "$mode" != "none" ] && [[ "$cmd" == codex* ]] && cmd="$cmd --cd $dst"
+    cmd=$(agent_command "$dst" "$mode")
+    [[ "$cmd" == "codex fork "* ]] && cmd="$cmd --cd $dst"
 
     open_in_tmux "$name" "$repo" "$dst" "$cmd" "$bg"
 
     note "cloned in $((t1 - t0))s -> branch fork/$name"
-    [ -z "$cmd" ] && note "no agent chat detected - opened a plain shell"
+    case "$cmd" in
+        *--fork-session|"codex fork"*) note "forked your current chat into it" ;;
+        claude|codex)                  note "opened a fresh $cmd chat in it" ;;
+        "")                            note "opened a plain shell" ;;
+    esac
     printf '%s\n' "$dst"
 }
 

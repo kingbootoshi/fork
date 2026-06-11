@@ -31,13 +31,20 @@ what happens:
 
 macOS / APFS only for now. Requires tmux.
 
+Works from a raw repo root too - no agent running yet: `fork <name>` clones,
+branches, and opens a FRESH claude chat in the fork (set `FORK_AGENT=codex`
+or pass `--codex` for codex). Inside an agent it forks the current chat;
+outside one it starts a new chat. Same command, both directions.
+
 ## Commands
 
 ```
-fork <name>             clone + branch + fork current agent chat into tmux
+fork <name>             clone + branch + chat in tmux:
+                          inside an agent -> forks the current chat
+                          raw terminal    -> fresh claude (FORK_AGENT=codex flips)
 fork <name> --no-agent  clone + branch + plain shell
-fork <name> --claude    force claude chat fork
-fork <name> --codex     force codex chat fork
+fork <name> --claude    claude in the fork (forks current chat, else fresh)
+fork <name> --codex     codex in the fork (forks current chat, else fresh)
 fork <name> --bg        do not steal focus / do not open a Terminal window
 fork ls                 list forks of the current repo
 fork path <name>        print a fork's path (cd "$(fork path x)")
