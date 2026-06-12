@@ -20,9 +20,10 @@ what happens:
        claude -> claude --resume <id> --fork-session   (session file copied
                  into the clone's project dir first)
        codex  -> codex fork $CODEX_THREAD_ID --cd <clone>
-  4. a tmux window opens in the clone running the forked chat
-       inside tmux  -> new window (a tab; detach-friendly over ssh)
-       outside tmux -> detached session + new Terminal.app window attached
+  4. the forked chat opens in its OWN window - a dedicated tmux session,
+     plus a new Terminal.app window attached to it (locally). your current
+     chat keeps focus; branch three times and you have three windows plus
+     the original, all alive. over ssh: attach command printed instead.
 ```
 
 ## Why
@@ -83,7 +84,7 @@ fork <name> --cached    zero-repay claude fork: chat stays in the original
 fork <name> --claude    claude in the fork (forks current chat, else fresh)
 fork <name> --codex     codex in the fork (forks current chat, else fresh)
 fork <name> --to <host> BEAM: move the work to another machine (see below)
-fork <name> --bg        do not steal focus / do not open a Terminal window
+fork <name> --bg        background: skip opening the Terminal window
 fork ls                 list forks of the current repo
 fork path <name>        print a fork's path (cd "$(fork path x)")
 fork merge <name>       fetch fork/<name> branch back into the source repo

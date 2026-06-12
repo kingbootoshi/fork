@@ -142,28 +142,25 @@ open_in_tmux() { # <name> <repo> <dst> <cmd> <bg>
     local line="$setup"
     [ -n "$cmd" ] && line="$setup; $cmd"
 
-    if [ -n "${TMUX:-}" ]; then
-        local flags=(-P -F '#{window_id}' -n "$name" -c "$dst")
-        [ "$bg" = "1" ] && flags=(-d "${flags[@]}")
-        local wid
-        wid=$(tmux new-window "${flags[@]}")
-        tmux send-keys -t "$wid" "$line" Enter
-        TMUX_TARGET="$wid"
-        note "forked into tmux window '$name'"
+    # Every fork gets its OWN tmux session and (locally) its own Terminal
+    # window - whether or not you're inside tmux. The chat you forked from
+    # never loses focus; branch three times and you have three windows plus
+    # your original, all alive. --bg skips opening the window.
+    local sess="fork-${repo}-${name}"
+    sess="${sess//[.:]/-}"
+    tmux new-session -d -s "$sess" -c "$dst" 2>/dev/null \
+        || die "tmux session '$sess' already exists"
+    tmux send-keys -t "$sess" "$line" Enter
+    TMUX_TARGET="$sess"
+
+    if [ "$bg" = "1" ]; then
+        note "forked into tmux session '$sess' (background) - attach with: tmux attach -t $sess"
+    elif [ -z "${SSH_TTY:-}${SSH_CONNECTION:-}" ] && command -v osascript >/dev/null 2>&1; then
+        osascript -e "tell application \"Terminal\" to do script \"tmux attach -t $sess\"" >/dev/null 2>&1 \
+            && note "forked into new Terminal window (tmux session '$sess')" \
+            || note "attach with: tmux attach -t $sess"
     else
-        local sess="fork-${repo}-${name}"
-        sess="${sess//[.:]/-}"
-        tmux new-session -d -s "$sess" -c "$dst" 2>/dev/null \
-            || die "tmux session '$sess' already exists"
-        tmux send-keys -t "$sess" "$line" Enter
-        TMUX_TARGET="$sess"
-        if [ "${TERM_PROGRAM:-}" = "Apple_Terminal" ] && [ -z "${SSH_TTY:-}" ] && [ "$bg" != "1" ]; then
-            osascript -e "tell application \"Terminal\" to do script \"tmux attach -t $sess\"" >/dev/null 2>&1 \
-                && note "forked into new Terminal window (tmux session '$sess')" \
-                || note "attach with: tmux attach -t $sess"
-        else
-            note "attach with: tmux attach -t $sess"
-        fi
+        note "attach with: tmux attach -t $sess"
     fi
 }
 
