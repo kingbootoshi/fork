@@ -132,6 +132,9 @@ reading usage numbers out of real session files):
   directory or (likely) another machine. A true `fork` is a new thread and
   always starts cold - one-time re-ingest, then warm. Beams therefore use
   `codex resume`: a beam is a move, not a branch.
+- **Claude's cache does not cross machines** (measured: same org, model,
+  version, and absolute path, inside the TTL - conversation still re-wrote).
+  A claude beam re-ingests history once on arrival, then runs warm.
 
 Rule of thumb: **branch on claude (`--cached`), move on codex (beam).**
 
