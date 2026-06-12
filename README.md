@@ -135,6 +135,28 @@ reading usage numbers out of real session files):
 
 Rule of thumb: **branch on claude (`--cached`), move on codex (beam).**
 
+## fork-guard: hard worktree boundaries
+
+Cached claude forks launch in the ORIGINAL directory (that's what keeps the
+prefix byte-identical) and steer work into the clone via a kickoff prompt.
+Instructions are soft; `fork-guard.sh` is hard: a Claude Code PreToolUse
+hook (installed by `install.sh`) that blocks Edit/Write/NotebookEdit calls
+targeting the original tree and Bash commands that mutate it - exit 2, with
+an error fed back to the model so it self-corrects to the worktree path.
+Outside forks the hook is a no-op: it exits instantly unless `FORK_WORKTREE`
+is set, which `fork` exports only into forked-agent sessions. Dogfooded
+proof: a forked agent given explicit in-chat permission to write into the
+original tree still got blocked at the tool layer, and the same fork's
+first request read its full 59k-token history from cache (in=290,
+cache_read=59,868).
+
+One sharp edge fork handles for you: **Claude Code loads NO hooks in a
+directory whose trust dialog was never accepted** - and bypass-permissions
+mode skips that dialog, so a freshly cloned path would stay untrusted (and
+hookless: no fork-guard, none of your own guardrail hooks either) forever.
+`fork` marks the launch directory trusted in `~/.claude.json` before
+starting the agent, exactly as accepting the dialog would.
+
 ## Notes
 
 - Each fork is a fully independent git repo (not a linked worktree). Merge

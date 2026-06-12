@@ -61,6 +61,36 @@ forks_dir_for() { # <root>
 #   raw terminal                                    -> FRESH chat
 # Default fresh agent is claude; set FORK_AGENT=codex to flip, or force with
 # --claude / --codex. --no-agent opens a plain shell.
+# Claude Code loads NO hooks - not fork-guard, not the user's own guardrail
+# hooks - in a directory whose trust dialog was never accepted. Bypass-
+# permissions mode skips that dialog, so a fresh clone would stay untrusted
+# (and hookless) forever. Mark the launch dir trusted in ~/.claude.json
+# before the agent starts - the exact flag accepting the dialog sets.
+TRUST_PY='import json, os, sys
+path = os.path.expanduser("~/.claude.json")
+real = os.path.realpath(sys.argv[1])
+try:
+    with open(path) as f:
+        data = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    data = {}
+proj = data.setdefault("projects", {}).setdefault(real, {})
+if proj.get("hasTrustDialogAccepted") is not True:
+    proj["hasTrustDialogAccepted"] = True
+    tmp = path + ".fork-tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)'
+
+trust_claude_dir() { # <dir>
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 -c "$TRUST_PY" "$1" 2>/dev/null || true
+}
+
+trust_remote_claude_dir() { # <host> <abs-dir>
+    remote_zsh "$1" "command -v python3 >/dev/null 2>&1 && python3 -c $(printf '%q' "$TRUST_PY") $(printf '%q' "$2")" 2>/dev/null || true
+}
+
 agent_command() { # <dst> <mode: auto|claude|codex|none>
     local dst="$1" mode="$2" sid src_file dst_enc
 
@@ -74,6 +104,7 @@ agent_command() { # <dst> <mode: auto|claude|codex|none>
     esac
 
     if [ "$mode" = "claude" ]; then
+        trust_claude_dir "$dst"
         sid="${CLAUDE_CODE_SESSION_ID:-}"
         src_file=""
         [ -n "$sid" ] && src_file=$(ls "$HOME/.claude/projects/"*/"$sid.jsonl" 2>/dev/null | head -1)
@@ -179,6 +210,7 @@ remote_agent_command() { # <host> <rdst_abs> <mode>
     esac
 
     if [ "$mode" = "claude" ]; then
+        trust_remote_claude_dir "$host" "$rdst"
         sid="${CLAUDE_CODE_SESSION_ID:-}"
         src_file=""
         [ -n "$sid" ] && src_file=$(ls "$HOME/.claude/projects/"*/"$sid.jsonl" 2>/dev/null | head -1)
@@ -401,7 +433,13 @@ cmd_create() {
     if [ "$cached" != "0" ] && [ -n "$sid" ] \
         && { [ "$mode" = "auto" ] || [ "$mode" = "claude" ]; } \
         && ls "$HOME/.claude/projects/"*/"$sid.jsonl" >/dev/null 2>&1; then
-        cmd="cd $(printf '%q' "$root") && claude --resume $sid --fork-session"
+        # FORK_WORKTREE/FORK_PROTECT arm the fork-guard PreToolUse hook:
+        # writes outside the worktree (esp. into the original tree) are
+        # blocked at the tool layer, not just discouraged by the kickoff.
+        # Trust the launch dir or claude silently loads no hooks at all.
+        trust_claude_dir "$root"
+        trust_claude_dir "$dst"
+        cmd="cd $(printf '%q' "$root") && FORK_WORKTREE=$(printf '%q' "$dst") FORK_PROTECT=$(printf '%q' "$root") claude --resume $sid --fork-session"
         kickoff="You are a forked timeline of this conversation. Your isolated worktree is $dst (branch fork/$name). Do ALL file reads, edits, builds, and commands there, always via absolute paths under $dst. First action: cd $dst. The original tree at $root belongs to another timeline - leave it untouched."
     else
         [ "$cached" = "1" ] && die "--cached needs a live claude code chat (codex caches by thread id, not content)"
