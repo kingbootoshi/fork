@@ -11,6 +11,9 @@
 #   fork <name> --claude   claude in the fork (forks current claude chat, else fresh)
 #   fork <name> --codex    codex in the fork (forks current codex chat, else fresh)
 #   fork <name> --no-agent clone repo + branch + plain shell in tmux
+#   fork <name> --to <ssh-host>  BEAM: rsync repo + chat to another machine,
+#                            agent resumes in a remote tmux, local window
+#                            auto-attaches over ssh (close the laptop freely)
 #   fork <name> --bg       create the tmux window without switching focus to it
 #   fork ls                list forks of the current repo
 #   fork path <name>       print a fork's path
@@ -30,7 +33,7 @@ FORKS_BASENAME=".forks"
 die() { printf 'fork: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*" >&2; }
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n "2,21p" "$0" | sed 's/^# \{0,1\}//'; }
 
 repo_root() {
     git rev-parse --show-toplevel 2>/dev/null || die "not inside a git repo"
@@ -129,23 +132,139 @@ open_in_tmux() { # <name> <repo> <dst> <cmd> <bg>
 }
 
 # ---------------------------------------------------------------------------
+# remote forks: beam the repo + chat to another machine over ssh
+# ---------------------------------------------------------------------------
+
+remote_zsh() { # <host> <command...>  - run through the remote login shell PATH
+    ssh -o BatchMode=yes "$1" "zsh -lc $(printf '%q' "$2")"
+}
+
+# Build the agent command for a REMOTE fork and ship the session file there.
+remote_agent_command() { # <host> <rdst_abs> <mode>
+    local host="$1" rdst="$2" mode="$3" sid src_file renc rel
+
+    case "$mode" in
+        none) return 0 ;;
+        auto)
+            if   [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then mode="claude"
+            elif [ -n "${CODEX_THREAD_ID:-}" ];        then mode="codex"
+            else mode="${FORK_AGENT:-claude}"
+            fi ;;
+    esac
+
+    if [ "$mode" = "claude" ]; then
+        sid="${CLAUDE_CODE_SESSION_ID:-}"
+        src_file=""
+        [ -n "$sid" ] && src_file=$(ls "$HOME/.claude/projects/"*/"$sid.jsonl" 2>/dev/null | head -1)
+        if [ -n "$src_file" ]; then
+            renc=$(encode_path "$rdst")
+            remote_zsh "$host" "mkdir -p ~/.claude/projects/$renc"
+            rsync -a "$src_file" "$host:.claude/projects/$renc/" >&2
+            printf 'claude --resume %s --fork-session' "$sid"
+        else
+            printf 'claude'
+        fi
+        return 0
+    fi
+
+    if [ "$mode" = "codex" ]; then
+        if [ -n "${CODEX_THREAD_ID:-}" ]; then
+            src_file=$(find "$HOME/.codex/sessions" -name "*${CODEX_THREAD_ID}.jsonl" 2>/dev/null | head -1)
+            if [ -n "$src_file" ]; then
+                rel=${src_file#"$HOME/.codex/sessions/"}
+                remote_zsh "$host" "mkdir -p ~/.codex/sessions/$(dirname "$rel")"
+                rsync -a "$src_file" "$host:.codex/sessions/$rel" >&2
+                printf 'codex fork %s --cd %s' "$CODEX_THREAD_ID" "$rdst"
+            else
+                printf 'codex'
+            fi
+        else
+            printf 'codex'
+        fi
+        return 0
+    fi
+    die "unknown agent mode: $mode"
+}
+
+cmd_create_remote() { # <name> <host> <mode> <bg>
+    local name="$1" host="$2" mode="$3" bg="$4"
+    case "$name" in
+        *[!A-Za-z0-9_-]*) die "remote fork names: letters, digits, - and _ only" ;;
+    esac
+
+    local root repo rbase rrepo rdst
+    root=$(repo_root)
+    repo=$(basename "$root")
+    rbase="${FORK_REMOTE_BASE:-Dev/.forks}"
+    rrepo="\$HOME/$rbase/$repo"
+
+    remote_zsh "$host" "mkdir -p $rrepo && [ ! -e $rrepo/$name ]" \
+        || die "fork '$name' already exists on $host (or ssh failed)"
+
+    note "beaming $repo -> $host:~/$rbase/$repo/$name ..."
+    local t0 t1
+    t0=$(date +%s)
+    rsync -az "$root/" "$host:$rbase/$repo/$name/"
+    t1=$(date +%s)
+
+    rdst=$(remote_zsh "$host" "cd $rrepo/$name && pwd -P")
+    remote_zsh "$host" "git -C $rrepo/$name switch -c fork/$name" >/dev/null 2>&1 \
+        || note "warning: branch fork/$name already exists on $host, staying on current branch"
+
+    local cmd
+    cmd=$(remote_agent_command "$host" "$rdst" "$mode")
+
+    local sess="fork-${repo}-${name}"
+    sess="${sess//[.:]/-}"
+    local line="export COMPOSE_PROJECT_NAME=${repo}-${name}"
+    [ -n "$cmd" ] && line="$line; $cmd"
+    remote_zsh "$host" "tmux new-session -d -s $sess -c $rrepo/$name" \
+        || die "tmux session '$sess' already exists on $host"
+    remote_zsh "$host" "tmux send-keys -t $sess \"$line\" Enter"
+
+    local attach="ssh -t $host \"zsh -lc 'tmux attach -t $sess'\""
+    if [ "$bg" != "1" ]; then
+        if [ -n "${TMUX:-}" ]; then
+            tmux new-window -n "$name@$host" "$attach" \
+                && note "attached in tmux window '$name@$host'"
+        elif [ "${TERM_PROGRAM:-}" = "Apple_Terminal" ] && [ -z "${SSH_TTY:-}" ]; then
+            osascript -e "tell application \"Terminal\" to do script \"$attach\"" >/dev/null 2>&1 \
+                && note "attached in new Terminal window"
+        fi
+    fi
+    note "attach anytime: $attach"
+    note "beamed in $((t1 - t0))s -> $host, branch fork/$name, tmux '$sess'"
+    case "$cmd" in
+        *--fork-session|"codex fork"*) note "your current chat is forked and running on $host" ;;
+        claude|codex)                  note "fresh $cmd chat running on $host" ;;
+    esac
+    printf '%s\n' "$host:$rdst"
+}
+
+# ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
 
 cmd_create() {
-    local name="" mode="auto" bg="0"
+    local name="" mode="auto" bg="0" host=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --claude) mode="claude" ;;
             --codex)  mode="codex" ;;
             --no-agent) mode="none" ;;
             --bg)     bg="1" ;;
+            --to)     shift; host="${1:-}"; [ -n "$host" ] || die "--to needs an ssh host" ;;
             -*)       die "unknown flag: $1" ;;
             *)        [ -n "$name" ] && die "one fork name only"; name="$1" ;;
         esac
         shift
     done
     [ -n "$name" ] || { usage; exit 2; }
+
+    if [ -n "$host" ]; then
+        cmd_create_remote "$name" "$host" "$mode" "$bg"
+        return 0
+    fi
     case "$name" in
         */*|.*) die "fork name must be a simple name (no slashes, no leading dot)" ;;
     esac
