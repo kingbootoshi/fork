@@ -224,19 +224,27 @@ cmd_create_remote() { # <name> <host> <mode> <bg> <prompt>
         *[!A-Za-z0-9_-]*) die "remote fork names: letters, digits, - and _ only" ;;
     esac
 
-    local root repo rbase rrepo rdst
+    local root repo rbase rrepo rdst sess
     root=$(repo_root)
     repo=$(basename "$root")
     rbase="${FORK_REMOTE_BASE:-Dev/.forks}"
     rrepo="\$HOME/$rbase/$repo"
+    sess="fork-${repo}-${name}"
+    sess="${sess//[.:]/-}"
 
-    remote_zsh "$host" "mkdir -p $rrepo && [ ! -e $rrepo/$name ]" \
-        || die "fork '$name' already exists on $host (or ssh failed)"
+    remote_zsh "$host" "tmux has-session -t $sess 2>/dev/null" \
+        && die "fork '$name' is already running on $host (tmux session $sess)"
+    remote_zsh "$host" "mkdir -p $rrepo/$name" \
+        || die "cannot reach $host over ssh"
 
+    # No -z by default: compression is a CPU bottleneck on LAN. Set
+    # FORK_RSYNC_FLAGS=-z for slow WAN links. Re-running an interrupted
+    # beam resumes where it left off (rsync delta).
     note "beaming $repo -> $host:~/$rbase/$repo/$name ..."
     local t0 t1
     t0=$(date +%s)
-    rsync -az "$root/" "$host:$rbase/$repo/$name/"
+    # shellcheck disable=SC2086
+    rsync -a ${FORK_RSYNC_FLAGS:-} "$root/" "$host:$rbase/$repo/$name/"
     t1=$(date +%s)
 
     rdst=$(remote_zsh "$host" "cd $rrepo/$name && pwd -P")
@@ -246,8 +254,6 @@ cmd_create_remote() { # <name> <host> <mode> <bg> <prompt>
     local cmd
     cmd=$(remote_agent_command "$host" "$rdst" "$mode")
 
-    local sess="fork-${repo}-${name}"
-    sess="${sess//[.:]/-}"
     local line="export COMPOSE_PROJECT_NAME=${repo}-${name}"
     [ -n "$cmd" ] && line="$line; $cmd"
     remote_zsh "$host" "tmux new-session -d -s $sess -c $rrepo/$name" \
