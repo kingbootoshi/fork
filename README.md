@@ -25,6 +25,38 @@ what happens:
        outside tmux -> detached session + new Terminal.app window attached
 ```
 
+## Why
+
+The most valuable moments in agent-assisted work happen mid-conversation.
+You've been deep in discussion for an hour, the agent holds the entire
+picture in context, and the thread arrives at a natural split: three
+features, independent, all buildable right now.
+
+The old move was opening fresh chats and re-explaining everything from
+zero, once per feature. That throws away the most expensive artifact you
+own - a primed conversation. Re-explaining costs time, money, and fidelity:
+the fresh chat never knows quite what the old one knew, and the old one was
+cached.
+
+`fork` treats the conversation as the asset:
+
+- **Fork at the moment of divergence.** When the discussion splits, the
+  chat splits with it. Each timeline carries the full shared history -
+  primed, cached, nothing re-explained.
+- **Isolation without setup.** Parallel agents need isolated worktrees with
+  the SAME local files - env, deps, build state - not a fresh checkout.
+  Copy-on-write cloning hands each timeline a 1:1 copy of the working
+  directory in about a second, for near-zero disk. A 10GB folder forks for
+  megabytes.
+- **Parallel by default.** Run 3-4 big features at once, each agent in its
+  own timeline and its own worktree, each committing PRs to main.
+- **Merge as a job.** When the parallel work lands, one fresh agent at the
+  repo root merges everything and resolves conflicts. Strong tests and
+  guardrails make the landing smooth.
+
+The bottleneck stops being setup and context-rebuilding. It becomes how
+many timelines you can read.
+
 ## Install
 
 ```bash
@@ -47,12 +79,31 @@ fork <name>             clone + branch + chat in tmux:
 fork <name> --no-agent  clone + branch + plain shell
 fork <name> --claude    claude in the fork (forks current chat, else fresh)
 fork <name> --codex     codex in the fork (forks current chat, else fresh)
+fork <name> --to <host> BEAM: move the work to another machine (see below)
 fork <name> --bg        do not steal focus / do not open a Terminal window
 fork ls                 list forks of the current repo
 fork path <name>        print a fork's path (cd "$(fork path x)")
 fork merge <name>       fetch fork/<name> branch back into the source repo
 fork trash <name>       trash a fork + kill its tmux window/session
 ```
+
+## Beam: move the work to another machine
+
+`fork <name> --to <ssh-host>` is "move to cloud" for your own hardware.
+Leaving the house mid-build? Beam the work to an always-on box and the
+agent keeps going without you:
+
+1. rsync ships the EXACT working state - dirty tree, staged index, .env
+   files, node_modules - to `~/Dev/.forks/<repo>/<name>` on the remote
+2. your current chat is forked onto the remote machine (same session-file
+   trick, shipped over ssh)
+3. the agent resumes inside a remote tmux session
+4. a local window auto-attaches via `ssh -t <host> tmux attach`
+
+Close the laptop whenever - the agent lives on the remote now. Reattach
+from anywhere with the printed attach command. Requires: ssh key auth to
+the host, tmux + the agent CLI installed there. `FORK_REMOTE_BASE`
+overrides the remote directory (default `Dev/.forks`).
 
 ## Layout
 
