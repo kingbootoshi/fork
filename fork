@@ -102,6 +102,8 @@ agent_command() { # <dst> <mode: auto|claude|codex|none>
 # tmux plumbing
 # ---------------------------------------------------------------------------
 
+TMUX_TARGET=""   # set by open_in_tmux for follow-up send-keys (autopilot)
+
 open_in_tmux() { # <name> <repo> <dst> <cmd> <bg>
     local name="$1" repo="$2" dst="$3" cmd="$4" bg="$5"
     local setup="export COMPOSE_PROJECT_NAME=${repo}-${name}"
@@ -114,6 +116,7 @@ open_in_tmux() { # <name> <repo> <dst> <cmd> <bg>
         local wid
         wid=$(tmux new-window "${flags[@]}")
         tmux send-keys -t "$wid" "$line" Enter
+        TMUX_TARGET="$wid"
         note "forked into tmux window '$name'"
     else
         local sess="fork-${repo}-${name}"
@@ -121,6 +124,7 @@ open_in_tmux() { # <name> <repo> <dst> <cmd> <bg>
         tmux new-session -d -s "$sess" -c "$dst" 2>/dev/null \
             || die "tmux session '$sess' already exists"
         tmux send-keys -t "$sess" "$line" Enter
+        TMUX_TARGET="$sess"
         if [ "${TERM_PROGRAM:-}" = "Apple_Terminal" ] && [ -z "${SSH_TTY:-}" ] && [ "$bg" != "1" ]; then
             osascript -e "tell application \"Terminal\" to do script \"tmux attach -t $sess\"" >/dev/null 2>&1 \
                 && note "forked into new Terminal window (tmux session '$sess')" \
@@ -129,6 +133,27 @@ open_in_tmux() { # <name> <repo> <dst> <cmd> <bg>
             note "attach with: tmux attach -t $sess"
         fi
     fi
+}
+
+# Local autopilot: wait for the agent TUI in a local tmux target, then send
+# the kickoff prompt (used by --cached forks to steer work into the clone).
+local_autopilot() { # <target> <prompt>
+    local target="$1" prompt="$2" i out
+    for i in $(seq 1 30); do
+        sleep 2
+        out=$(tmux capture-pane -t "$target" -p 2>/dev/null) || return 0
+        if printf '%s' "$out" | grep -q "Resume from summary"; then
+            tmux send-keys -t "$target" 2; sleep 1; tmux send-keys -t "$target" Enter
+            continue
+        fi
+        if printf '%s' "$out" | grep -qE 'bypass permissions|\? for shortcuts|shift\+tab'; then
+            tmux send-keys -t "$target" "$prompt"; sleep 1
+            tmux send-keys -t "$target" Enter
+            note "cached fork: worktree instructions sent"
+            return 0
+        fi
+    done
+    note "cached fork: TUI never came up - send the worktree instructions manually"
 }
 
 # ---------------------------------------------------------------------------
@@ -174,7 +199,11 @@ remote_agent_command() { # <host> <rdst_abs> <mode>
                 rel=${src_file#"$HOME/.codex/sessions/"}
                 remote_zsh "$host" "mkdir -p ~/.codex/sessions/$(dirname "$rel")"
                 rsync -a "$src_file" "$host:.codex/sessions/$rel" >&2
-                printf 'codex fork %s --cd %s' "$CODEX_THREAD_ID" "$rdst"
+                # resume, not fork: codex routes its prompt cache by thread id,
+                # so resume is fully cached while fork always starts cold. A
+                # beam is a MOVE - the laptop side stops - so same-thread
+                # continuation is correct and free.
+                printf 'codex resume %s --cd %s' "$CODEX_THREAD_ID" "$rdst"
             else
                 printf 'codex'
             fi
@@ -296,7 +325,7 @@ cmd_create_remote() { # <name> <host> <mode> <bg> <prompt>
     note "attach anytime: $attach"
     note "beamed in $((t1 - t0))s -> $host, branch fork/$name, tmux '$sess'"
     case "$cmd" in
-        *--fork-session|"codex fork"*) note "your current chat is forked and running on $host" ;;
+        *--fork-session|"codex "*) note "your current chat is live on $host (cached continuation)" ;;
         claude|codex)                  note "fresh $cmd chat running on $host" ;;
     esac
     printf '%s\n' "$host:$rdst"
@@ -307,13 +336,14 @@ cmd_create_remote() { # <name> <host> <mode> <bg> <prompt>
 # ---------------------------------------------------------------------------
 
 cmd_create() {
-    local name="" mode="auto" bg="0" host="" prompt=""
+    local name="" mode="auto" bg="0" host="" prompt="" cached="0"
     while [ $# -gt 0 ]; do
         case "$1" in
             --claude) mode="claude" ;;
             --codex)  mode="codex" ;;
             --no-agent) mode="none" ;;
             --bg)     bg="1" ;;
+            --cached) cached="1" ;;
             --to)     shift; host="${1:-}"; [ -n "$host" ] || die "--to needs an ssh host" ;;
             -*)       die "unknown flag: $1" ;;
             *)
@@ -360,15 +390,27 @@ cmd_create() {
         (cd "$dst" && direnv allow) 2>/dev/null && note "direnv: fork .envrc approved"
     fi
 
-    local cmd
-    cmd=$(agent_command "$dst" "$mode")
-    [[ "$cmd" == "codex fork "* ]] && cmd="$cmd --cd $dst"
+    local cmd kickoff=""
+    if [ "$cached" = "1" ]; then
+        # Zero-repay claude fork: launch the forked chat in the ORIGINAL
+        # directory so the request prefix stays byte-identical (full cache
+        # hit), and steer all work into the clone via the kickoff prompt
+        # (appended messages never bust a prefix cache).
+        [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] \
+            || die "--cached needs a live claude code chat (codex caches by thread id, not content - plain fork is the only codex branch)"
+        cmd="cd $(printf '%q' "$root") && claude --resume $CLAUDE_CODE_SESSION_ID --fork-session"
+        kickoff="You are a forked timeline of this conversation. Your isolated worktree is $dst (branch fork/$name). Do ALL file reads, edits, builds, and commands there, always via absolute paths under $dst. The original tree at $root belongs to another timeline - leave it untouched."
+    else
+        cmd=$(agent_command "$dst" "$mode")
+        [[ "$cmd" == "codex fork "* ]] && cmd="$cmd --cd $dst"
+    fi
 
     open_in_tmux "$name" "$repo" "$dst" "$cmd" "$bg"
+    [ -n "$kickoff" ] && local_autopilot "$TMUX_TARGET" "$kickoff"
 
     note "cloned in $((t1 - t0))s -> branch fork/$name"
     case "$cmd" in
-        *--fork-session|"codex fork"*) note "forked your current chat into it" ;;
+        *--fork-session|"codex fork"*|"codex resume"*) note "forked your current chat into it" ;;
         claude|codex)                  note "opened a fresh $cmd chat in it" ;;
         "")                            note "opened a plain shell" ;;
     esac
