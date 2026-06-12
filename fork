@@ -186,8 +186,40 @@ remote_agent_command() { # <host> <rdst_abs> <mode>
     die "unknown agent mode: $mode"
 }
 
-cmd_create_remote() { # <name> <host> <mode> <bg>
-    local name="$1" host="$2" mode="$3" bg="$4"
+# After launching the remote agent, drive it to a working state with zero
+# human interaction: answer the resume-size picker (full session), wait for
+# the TUI to be ready, then send the kickoff prompt so the agent starts
+# working immediately.
+beam_autopilot() { # <host> <sess> <prompt>
+    local host="$1" sess="$2" prompt="$3" i out
+    note "autopilot: waiting for the remote agent to come up ..."
+    for i in $(seq 1 45); do
+        sleep 2
+        out=$(remote_zsh "$host" "tmux capture-pane -t $sess -p" 2>/dev/null) || return 0
+        if printf '%s' "$out" | grep -q "Resume from summary"; then
+            remote_zsh "$host" "tmux send-keys -t $sess 2" >/dev/null
+            sleep 1
+            remote_zsh "$host" "tmux send-keys -t $sess Enter" >/dev/null
+            note "autopilot: chose full-session resume"
+            continue
+        fi
+        if printf '%s' "$out" | grep -qE 'bypass permissions|\? for shortcuts|shift\+tab'; then
+            if [ -n "$prompt" ]; then
+                remote_zsh "$host" "tmux send-keys -t $sess $(printf '%q' "$prompt")" >/dev/null
+                sleep 1
+                remote_zsh "$host" "tmux send-keys -t $sess Enter" >/dev/null
+                note "autopilot: kickoff prompt sent - the agent is working"
+            else
+                note "autopilot: remote agent is up and ready"
+            fi
+            return 0
+        fi
+    done
+    note "autopilot: timed out waiting for the TUI - attach and check manually"
+}
+
+cmd_create_remote() { # <name> <host> <mode> <bg> <prompt>
+    local name="$1" host="$2" mode="$3" bg="$4" prompt="$5"
     case "$name" in
         *[!A-Za-z0-9_-]*) die "remote fork names: letters, digits, - and _ only" ;;
     esac
@@ -232,6 +264,7 @@ cmd_create_remote() { # <name> <host> <mode> <bg>
                 && note "attached in new Terminal window"
         fi
     fi
+    [ -n "$cmd" ] && beam_autopilot "$host" "$sess" "$prompt"
     note "attach anytime: $attach"
     note "beamed in $((t1 - t0))s -> $host, branch fork/$name, tmux '$sess'"
     case "$cmd" in
@@ -246,7 +279,7 @@ cmd_create_remote() { # <name> <host> <mode> <bg>
 # ---------------------------------------------------------------------------
 
 cmd_create() {
-    local name="" mode="auto" bg="0" host=""
+    local name="" mode="auto" bg="0" host="" prompt=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --claude) mode="claude" ;;
@@ -255,14 +288,19 @@ cmd_create() {
             --bg)     bg="1" ;;
             --to)     shift; host="${1:-}"; [ -n "$host" ] || die "--to needs an ssh host" ;;
             -*)       die "unknown flag: $1" ;;
-            *)        [ -n "$name" ] && die "one fork name only"; name="$1" ;;
+            *)
+                if   [ -z "$name" ];   then name="$1"
+                elif [ -z "$prompt" ]; then prompt="$1"
+                else die "usage: fork <name> [\"kickoff prompt\"] [flags]"
+                fi ;;
         esac
         shift
     done
     [ -n "$name" ] || { usage; exit 2; }
+    [ -n "$prompt" ] && [ -z "$host" ] && die "kickoff prompts work with --to <host> beams (for now)"
 
     if [ -n "$host" ]; then
-        cmd_create_remote "$name" "$host" "$mode" "$bg"
+        cmd_create_remote "$name" "$host" "$mode" "$bg" "$prompt"
         return 0
     fi
     case "$name" in
