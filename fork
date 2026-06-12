@@ -270,6 +270,8 @@ cmd_create_remote() { # <name> <host> <mode> <bg> <prompt>
     rdst=$(remote_zsh "$host" "cd $rrepo/$name && pwd -P")
     remote_zsh "$host" "git -C $rrepo/$name switch -c fork/$name" >/dev/null 2>&1 \
         || note "warning: branch fork/$name already exists on $host, staying on current branch"
+    remote_zsh "$host" "[ -f $rrepo/$name/.envrc ] && command -v direnv >/dev/null && cd $rrepo/$name && direnv allow" >/dev/null 2>&1 \
+        && note "direnv: remote .envrc approved"
 
     local cmd
     cmd=$(remote_agent_command "$host" "$rdst" "$mode")
@@ -351,6 +353,12 @@ cmd_create() {
 
     git -C "$dst" switch -c "fork/$name" >/dev/null 2>&1 \
         || note "warning: branch fork/$name already exists, staying on current branch"
+
+    # The clone's .envrc is byte-identical to the already-trusted source one;
+    # approve it so direnv loads (envx decryption etc.) immediately.
+    if [ -f "$dst/.envrc" ] && command -v direnv >/dev/null; then
+        (cd "$dst" && direnv allow) 2>/dev/null && note "direnv: fork .envrc approved"
+    fi
 
     local cmd
     cmd=$(agent_command "$dst" "$mode")
