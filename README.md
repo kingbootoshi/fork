@@ -1,5 +1,7 @@
 # fork
 
+![fork - one timeline becomes two](images/fork_timeline_split.jpeg)
+
 Instant copy-on-write repo forks with forked agent chats.
 
 Type `fork <name>` inside Claude Code or Codex shell mode (`!`) and get a new
