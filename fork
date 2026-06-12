@@ -10,6 +10,7 @@
 #                            raw terminal    -> fresh claude (FORK_AGENT=codex flips)
 #   fork <name> --claude   claude in the fork (forks current claude chat, else fresh)
 #   fork <name> --codex    codex in the fork (forks current codex chat, else fresh)
+#   fork <name> --isolated chat moves INTO the clone (re-ingests history once)
 #   fork <name> --no-agent clone repo + branch + plain shell in tmux
 #   fork <name> --to <ssh-host>  BEAM: rsync repo + chat to another machine,
 #                            agent resumes in a remote tmux, local window
@@ -344,6 +345,7 @@ cmd_create() {
             --no-agent) mode="none" ;;
             --bg)     bg="1" ;;
             --cached) cached="1" ;;
+            --isolated) cached="0" ;;
             --to)     shift; host="${1:-}"; [ -n "$host" ] || die "--to needs an ssh host" ;;
             -*)       die "unknown flag: $1" ;;
             *)
@@ -390,17 +392,19 @@ cmd_create() {
         (cd "$dst" && direnv allow) 2>/dev/null && note "direnv: fork .envrc approved"
     fi
 
-    local cmd kickoff=""
-    if [ "$cached" = "1" ]; then
-        # Zero-repay claude fork: launch the forked chat in the ORIGINAL
-        # directory so the request prefix stays byte-identical (full cache
-        # hit), and steer all work into the clone via the kickoff prompt
-        # (appended messages never bust a prefix cache).
-        [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] \
-            || die "--cached needs a live claude code chat (codex caches by thread id, not content - plain fork is the only codex branch)"
-        cmd="cd $(printf '%q' "$root") && claude --resume $CLAUDE_CODE_SESSION_ID --fork-session"
-        kickoff="You are a forked timeline of this conversation. Your isolated worktree is $dst (branch fork/$name). Do ALL file reads, edits, builds, and commands there, always via absolute paths under $dst. The original tree at $root belongs to another timeline - leave it untouched."
+    # Zero-repay claude forks are the DEFAULT: launch the forked chat in the
+    # ORIGINAL directory so the request prefix stays byte-identical (full
+    # prompt-cache hit), and steer all work into the clone via the kickoff
+    # prompt (appended messages never bust a prefix cache). --isolated opts
+    # out: the chat moves into the clone and re-ingests its history once.
+    local cmd kickoff="" sid="${CLAUDE_CODE_SESSION_ID:-}"
+    if [ "$cached" != "0" ] && [ -n "$sid" ] \
+        && { [ "$mode" = "auto" ] || [ "$mode" = "claude" ]; } \
+        && ls "$HOME/.claude/projects/"*/"$sid.jsonl" >/dev/null 2>&1; then
+        cmd="cd $(printf '%q' "$root") && claude --resume $sid --fork-session"
+        kickoff="You are a forked timeline of this conversation. Your isolated worktree is $dst (branch fork/$name). Do ALL file reads, edits, builds, and commands there, always via absolute paths under $dst. First action: cd $dst. The original tree at $root belongs to another timeline - leave it untouched."
     else
+        [ "$cached" = "1" ] && die "--cached needs a live claude code chat (codex caches by thread id, not content)"
         cmd=$(agent_command "$dst" "$mode")
         [[ "$cmd" == "codex fork "* ]] && cmd="$cmd --cd $dst"
     fi

@@ -77,6 +77,9 @@ fork <name>             clone + branch + chat in tmux:
                           inside an agent -> forks the current chat
                           raw terminal    -> fresh claude (FORK_AGENT=codex flips)
 fork <name> --no-agent  clone + branch + plain shell
+fork <name> --cached    zero-repay claude fork: chat stays in the original
+                        dir (byte-identical prefix = full prompt-cache hit),
+                        an auto-sent kickoff steers all work into the clone
 fork <name> --claude    claude in the fork (forks current chat, else fresh)
 fork <name> --codex     codex in the fork (forks current chat, else fresh)
 fork <name> --to <host> BEAM: move the work to another machine (see below)
@@ -113,6 +116,24 @@ Forks live beside the repo (same volume - required for clonefile):
 ~/code/app/                   source
 ~/code/.forks/app/parser-fix  fork
 ```
+
+## Prompt-cache economics
+
+Forked chats reuse the provider's prompt cache - that's half the point. The
+two agents cache differently, so the free paths differ (all verified by
+reading usage numbers out of real session files):
+
+- **Claude caches by content prefix.** A fork in the SAME directory is a
+  full cache hit. Moving directories rewrites the cwd into the early
+  context and re-ingests the conversation once. `--cached` dodges this
+  entirely: the chat launches in the original directory (identical bytes,
+  full hit) and works in the clone via absolute paths.
+- **Codex caches by thread id.** `resume` is a full hit even in a different
+  directory or (likely) another machine. A true `fork` is a new thread and
+  always starts cold - one-time re-ingest, then warm. Beams therefore use
+  `codex resume`: a beam is a move, not a branch.
+
+Rule of thumb: **branch on claude (`--cached`), move on codex (beam).**
 
 ## Notes
 
