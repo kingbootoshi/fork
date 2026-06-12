@@ -337,7 +337,7 @@ cmd_create_remote() { # <name> <host> <mode> <bg> <prompt>
 # ---------------------------------------------------------------------------
 
 cmd_create() {
-    local name="" mode="auto" bg="0" host="" prompt="" cached="0"
+    local name="" mode="auto" bg="0" host="" prompt="" cached="auto"
     while [ $# -gt 0 ]; do
         case "$1" in
             --claude) mode="claude" ;;
