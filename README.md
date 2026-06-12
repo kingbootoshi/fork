@@ -57,8 +57,8 @@ fork trash <name>       trash a fork + kill its tmux window/session
 Forks live beside the repo (same volume - required for clonefile):
 
 ```
-~/Dev/axia-os/                   source
-~/Dev/.forks/axia-os/parser-fix  fork
+~/code/app/                   source
+~/code/.forks/app/parser-fix  fork
 ```
 
 ## Notes
