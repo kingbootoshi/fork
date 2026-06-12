@@ -240,11 +240,31 @@ cmd_create_remote() { # <name> <host> <mode> <bg> <prompt>
     # No -z by default: compression is a CPU bottleneck on LAN. Set
     # FORK_RSYNC_FLAGS=-z for slow WAN links. Re-running an interrupted
     # beam resumes where it left off (rsync delta).
-    note "beaming $repo -> $host:~/$rbase/$repo/$name ..."
+    local total_mb
+    total_mb=$(du -sm "$root" 2>/dev/null | cut -f1)
+    note "beaming $repo (${total_mb}MB) -> $host:~/$rbase/$repo/$name ..."
     local t0 t1
     t0=$(date +%s)
     # shellcheck disable=SC2086
-    rsync -a ${FORK_RSYNC_FLAGS:-} "$root/" "$host:$rbase/$repo/$name/"
+    rsync -a ${FORK_RSYNC_FLAGS:-} "$root/" "$host:$rbase/$repo/$name/" &
+    local rpid=$!
+    local done_mb pct last_mb=0 rate eta
+    while kill -0 "$rpid" 2>/dev/null; do
+        sleep 8
+        kill -0 "$rpid" 2>/dev/null || break
+        done_mb=$(remote_zsh "$host" "du -sm $rrepo/$name 2>/dev/null | cut -f1" 2>/dev/null) || continue
+        [ -n "$done_mb" ] && [ "$done_mb" -gt 0 ] || continue
+        pct=$(( done_mb * 100 / total_mb )); [ "$pct" -gt 100 ] && pct=100
+        rate=$(( (done_mb - last_mb) / 8 ))
+        if [ "$rate" -gt 0 ] && [ "$done_mb" -lt "$total_mb" ]; then
+            eta=$(( (total_mb - done_mb) / rate ))
+            note "beam: ${pct}%  (${done_mb}/${total_mb}MB, ${rate}MB/s, ~$(( eta / 60 ))m$(( eta % 60 ))s left)"
+        else
+            note "beam: ${pct}%  (${done_mb}/${total_mb}MB)"
+        fi
+        last_mb=$done_mb
+    done
+    wait "$rpid" || die "rsync transfer failed"
     t1=$(date +%s)
 
     rdst=$(remote_zsh "$host" "cd $rrepo/$name && pwd -P")
